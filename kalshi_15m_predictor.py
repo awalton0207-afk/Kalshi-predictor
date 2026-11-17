@@ -15,6 +15,12 @@ What goes into each call:
   4. Warnings          - too close to call, quiet market, bot vs Kalshi disagreeing
   5. Scorecard         - every call is saved to kalshi_predictions.csv and checked
                          against the real result, so you can see how accurate it is.
+  6. Paper trades      - each call is paper-traded (no real money) using rules borrowed
+                         from Pondletter's Ping tool: start at 1 contract, buy at the real
+                         ask only if there are contracts for sale there, count Kalshi's fee,
+                         and stop for the day after a set loss (daily loss limit).
+                         Like Ping, paper results still leave out partial fills, your place
+                         in line and outages, so real results can be worse.
 
 This only sends predictions. It never places bets. Not financial advice.
 
@@ -60,6 +66,11 @@ TILT_PER_POINT = 0.01             # each technicals point moves the odds 1%
 MAX_TILT = 0.05                   # technicals can move the odds 5% at most
 NEAR_STRIKE_DOLLARS = 20          # within $20 of the target = too close to call
 KALSHI_FEE_RATE = 0.07            # Kalshi taker fee is about 0.07 x price x (1 - price)
+# Paper trading (rules borrowed from Pondletter's Ping)
+PAPER_CONTRACTS = 1               # start small: 1 contract per call
+DAILY_LOSS_LIMIT = 3.00           # stop paper trading for the day after losing this many dollars
+VALUE_EDGE = 0.01                 # a "value" call: bot odds beat the price + fee by over 1 cent
+
 # How long one cloud run lasts before it hands off to the next one (GitHub allows 6 hours)
 MAX_RUNTIME_MINUTES = float(os.environ.get("MAX_RUNTIME_MINUTES", "0"))   # 0 = run forever
 # ========================================================
@@ -69,7 +80,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "kalshi_predictions.csv")
 LOG_FIELDS = ["ticker", "close_time_utc", "sent_at_utc", "minutes_left", "call", "bot_odds",
               "confidence", "kalshi_up_odds", "kalshi_favorite", "price_model_up", "tech_score",
-              "target", "btc_price", "too_close", "result"]
+              "target", "btc_price", "too_close", "result",
+              "paper_price", "paper_fee", "paper_note", "value_call", "paper_pnl"]
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -212,6 +224,18 @@ def pct(a, b):
     return (a - b) / b * 100
 
 
+def kalshi_fee(price, contracts=1):
+    """Kalshi taker fee: 0.07 x contracts x price x (1 - price), rounded up to the next cent."""
+    return math.ceil(round(KALSHI_FEE_RATE * contracts * price * (1 - price) * 100, 6)) / 100
+
+
+def to_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 # ----------------------- signals ------------------------
 def technicals(c15, c1, c60, price):
     """Grok's signals. Positive score leans UP, negative leans DOWN."""
@@ -339,6 +363,11 @@ def update_results():
             continue
         if res in ("yes", "no"):
             row["result"] = "UP" if res == "yes" else "DOWN"
+            price, fee = to_float(row.get("paper_price")), to_float(row.get("paper_fee"))
+            if price is not None:
+                won = row["call"] == row["result"]
+                pnl = ((1 - price) if won else -price) * PAPER_CONTRACTS - (fee or 0)
+                row["paper_pnl"] = f"{pnl:.2f}"
             changed = True
     if changed:
         write_log(rows)
@@ -362,7 +391,42 @@ def scorecard(rows):
     if fav:
         f = sum(r["kalshi_favorite"] == r["result"] for r in fav)
         lines.append(f"Just following Kalshi's favorite: {f}/{len(fav)} ({f / len(fav):.0%})")
+    lines += paper_summary(rows)
     return "\n".join(lines)
+
+
+def et_date(iso):
+    dt = parse_time(iso)
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.astimezone(ZoneInfo("America/New_York")).date()
+    except Exception:
+        return dt.astimezone().date()
+
+
+def paper_today(rows, today):
+    return sum(to_float(r.get("paper_pnl")) or 0 for r in rows
+               if r.get("paper_pnl") and r.get("sent_at_utc") and et_date(r["sent_at_utc"]) == today)
+
+
+def paper_summary(rows):
+    traded = [r for r in rows if r.get("paper_pnl")]
+    if not traded:
+        return []
+    today = et_date(datetime.now(timezone.utc).isoformat())
+
+    def line(label, group):
+        if not group:
+            return f"• {label}: no trades yet"
+        total = sum(float(r["paper_pnl"]) for r in group)
+        day = sum(float(r["paper_pnl"]) for r in group if et_date(r["sent_at_utc"]) == today)
+        wins = sum(float(r["paper_pnl"]) > 0 for r in group)
+        return (f"• {label}: today {day:+.2f} | all-time {total:+.2f} "
+                f"({wins}/{len(group)} won)")
+
+    return ["", f"Paper trades ({PAPER_CONTRACTS} contract, fees included, $):",
+            line("Every call", traded),
+            line("Only value calls", [r for r in traded if r.get("value_call") == "yes"])]
 
 
 # ----------------------- alerts -------------------------
@@ -432,14 +496,33 @@ def make_call():
     ask = kalshi_price(m, "yes_ask" if call == "UP" else "no_ask")
     value_line = "Kalshi price: not available"
     if ask:
-        fee = KALSHI_FEE_RATE * ask * (1 - ask)
+        fee = kalshi_fee(ask)
         edge = odds - ask - fee
-        verdict = (f"bot sees about +{edge * 100:.0f}¢ value" if edge > 0.01
+        verdict = (f"bot sees about +{edge * 100:.0f}¢ value" if edge > VALUE_EDGE
                    else "no real value at this price")
-        value_line = (f"{call} costs {ask * 100:.0f}¢ + ~{fee * 100:.1f}¢ fee; "
+        value_line = (f"{call} costs {ask * 100:.0f}¢ + {fee * 100:.0f}¢ fee; "
                       f"bot odds {odds:.0%} → {verdict}")
 
+    # Paper trade (Ping-style rules: 1 contract, real ask, fee counted, daily loss limit)
+    today_pnl = paper_today(rows, et_date(now.isoformat()))
+    size = to_float(m.get("yes_ask_size_fp" if call == "UP" else "yes_bid_size_fp"))
+    paper_price = paper_fee = None
+    if today_pnl <= -DAILY_LOSS_LIMIT:
+        paper_note = f"skipped: daily loss limit hit ({today_pnl:+.2f} today)"
+    elif not ask or ask >= 1:
+        paper_note = "skipped: no price to buy at"
+    elif size is not None and size < PAPER_CONTRACTS:
+        paper_note = "skipped: no contracts for sale at the ask"
+    else:
+        paper_price, paper_fee = ask, kalshi_fee(ask, PAPER_CONTRACTS)
+        paper_note = (f"bought {PAPER_CONTRACTS} {call} at {ask * 100:.0f}¢ + {paper_fee * 100:.0f}¢ fee "
+                      f"(win +{(1 - ask) * PAPER_CONTRACTS - paper_fee:.2f} / lose "
+                      f"-{ask * PAPER_CONTRACTS + paper_fee:.2f})")
+    value_call = bool(ask) and odds - ask - kalshi_fee(ask) > VALUE_EDGE
+
     warnings = []
+    if today_pnl <= -DAILY_LOSS_LIMIT:
+        warnings.append(f"🛑 Daily loss limit hit ({today_pnl:+.2f} today): no more paper trades today.")
     if too_close:
         warnings.append(f"⚠️ Too close to call: BTC is only ${abs(diff):,.0f} from the target. "
                         "Small moves (and Coinbase vs Kalshi's price index) can flip it.")
@@ -460,7 +543,7 @@ def make_call():
          f"• Kalshi odds: {p_market:.0%} UP" if p_market is not None else "• Kalshi odds: not available",
          f"• Technicals: score {score:+d} → {tilt * 100:+.0f}% nudge"]
         + [f"   - {t}" for t in tech_lines]
-        + ["", value_line]
+        + ["", value_line, f"Paper trade: {paper_note}"]
         + ([""] + warnings if warnings else [])
         + ["", scorecard(rows)]
     )
@@ -475,7 +558,10 @@ def make_call():
                      "confidence": confidence.split(" ")[0], "kalshi_up_odds":
                      "" if p_market is None else f"{p_market:.3f}", "kalshi_favorite": favorite or "",
                      "price_model_up": f"{p_model:.3f}", "tech_score": score, "target": target,
-                     "btc_price": price, "too_close": "yes" if too_close else "", "result": ""})
+                     "btc_price": price, "too_close": "yes" if too_close else "", "result": "",
+                     "paper_price": "" if paper_price is None else f"{paper_price:.4f}",
+                     "paper_fee": "" if paper_fee is None else f"{paper_fee:.2f}",
+                     "paper_note": paper_note, "value_call": "yes" if value_call else ""})
         write_log(rows)
 
 
@@ -496,7 +582,9 @@ def main():
     started = datetime.now(timezone.utc)
     stop_at = started + timedelta(minutes=MAX_RUNTIME_MINUTES) if MAX_RUNTIME_MINUTES else None
     print(f"Kalshi BTC 15-min predictor running. Calls go out {LEAD_MINUTES} min before each close.")
-    if os.environ.get("GITHUB_EVENT_NAME") != "schedule":   # stay quiet on automatic restarts
+    automatic = (os.environ.get("GITHUB_EVENT_NAME") == "schedule"
+                 or os.environ.get("HANDOFF") == "true")
+    if not automatic:                                        # stay quiet on automatic restarts
         notify("Kalshi BTC predictor started",
                f"You'll get an UP/DOWN call {LEAD_MINUTES} minutes before every 15-minute window closes.")
     while True:
