@@ -22,9 +22,15 @@ What goes into each call:
                          Like Ping, paper results still leave out partial fills, your place
                          in line and outages, so real results can be worse.
 
-This only sends predictions. It never places bets. Not financial advice.
+  7. Real bets (optional) - when REAL_TRADING is "on" and a Kalshi API key is set,
+                         it places a real $5 bet on HIGH-confidence calls only, priced
+                         92¢ or less. It stops for the day after losing $10 and stops
+                         completely after losing $25 in total. Bets are fill-or-kill at the
+                         current ask, so it never pays more than the price it saw.
 
-Setup: pip install requests     Run: python kalshi_15m_predictor.py
+Without a Kalshi API key it only sends predictions. Not financial advice.
+
+Setup: pip install requests cryptography     Run: python kalshi_15m_predictor.py
 Test:  python kalshi_15m_predictor.py --now    (sends one call right away)
 """
 
@@ -71,6 +77,15 @@ PAPER_CONTRACTS = 1               # start small: 1 contract per call
 DAILY_LOSS_LIMIT = 3.00           # stop paper trading for the day after losing this many dollars
 VALUE_EDGE = 0.01                 # a "value" call: bot odds beat the price + fee by over 1 cent
 
+# Real bets (only when REAL_TRADING is "on" AND both Kalshi key secrets are set)
+REAL_TRADING = os.environ.get("REAL_TRADING", "").strip().lower() == "on"
+KALSHI_KEY_ID = os.environ.get("KALSHI_KEY_ID", "").strip()
+KALSHI_PRIVATE_KEY = os.environ.get("KALSHI_PRIVATE_KEY", "").strip()
+REAL_BET_DOLLARS = 5.00           # most a single bet can cost, fee included
+REAL_MAX_PRICE = 0.92             # skip calls priced above 92¢ (payout too small)
+REAL_DAILY_LOSS_LIMIT = 10.00     # no more real bets today after losing this much
+REAL_TOTAL_LOSS_LIMIT = 25.00     # no more real bets at all after losing this much in total
+
 # How long one cloud run lasts before it hands off to the next one (GitHub allows 6 hours)
 MAX_RUNTIME_MINUTES = float(os.environ.get("MAX_RUNTIME_MINUTES", "0"))   # 0 = run forever
 # ========================================================
@@ -81,7 +96,8 @@ LOG_FILE = os.path.join(HERE, "kalshi_predictions.csv")
 LOG_FIELDS = ["ticker", "close_time_utc", "sent_at_utc", "minutes_left", "call", "bot_odds",
               "confidence", "kalshi_up_odds", "kalshi_favorite", "price_model_up", "tech_score",
               "target", "btc_price", "too_close", "result",
-              "paper_price", "paper_fee", "paper_note", "value_call", "paper_pnl"]
+              "paper_price", "paper_fee", "paper_note", "value_call", "paper_pnl",
+              "real_count", "real_cost", "real_note", "real_pnl"]
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -368,6 +384,10 @@ def update_results():
                 won = row["call"] == row["result"]
                 pnl = ((1 - price) if won else -price) * PAPER_CONTRACTS - (fee or 0)
                 row["paper_pnl"] = f"{pnl:.2f}"
+            count, cost = to_float(row.get("real_count")), to_float(row.get("real_cost"))
+            if count and cost is not None:
+                won = row["call"] == row["result"]
+                row["real_pnl"] = f"{(count if won else 0) - cost:.2f}"
             changed = True
     if changed:
         write_log(rows)
@@ -424,9 +444,106 @@ def paper_summary(rows):
         return (f"• {label}: today {day:+.2f} | all-time {total:+.2f} "
                 f"({wins}/{len(group)} won)")
 
-    return ["", f"Paper trades ({PAPER_CONTRACTS} contract, fees included, $):",
-            line("Every call", traded),
-            line("Only value calls", [r for r in traded if r.get("value_call") == "yes"])]
+    out = ["", f"Paper trades ({PAPER_CONTRACTS} contract, fees included, $):",
+           line("Every call", traded),
+           line("Only value calls", [r for r in traded if r.get("value_call") == "yes"])]
+    real = [r for r in rows if r.get("real_pnl")]
+    if real:
+        out += ["", "REAL money ($5 high-confidence bets, fees included):", line("Real bets", real)]
+    return out
+
+
+# --------------------- real bets ------------------------
+def real_pnl_since(rows, today=None):
+    return sum(to_float(r.get("real_pnl")) or 0 for r in rows if r.get("real_pnl")
+               and (today is None or et_date(r["sent_at_utc"]) == today))
+
+
+def kalshi_signed(method, path, body=None):
+    """Signed request to Kalshi's trading API (RSA-PSS signature, as Kalshi requires)."""
+    import base64
+    import json
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    key = serialization.load_pem_private_key(KALSHI_PRIVATE_KEY.replace("\\n", "\n").encode(),
+                                             password=None)
+    ts = str(int(time.time() * 1000))
+    full_path = "/trade-api/v2" + path
+    sig = key.sign((ts + method + full_path).encode(),
+                   padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                               salt_length=padding.PSS.DIGEST_LENGTH),
+                   hashes.SHA256())
+    headers = {"KALSHI-ACCESS-KEY": KALSHI_KEY_ID, "KALSHI-ACCESS-TIMESTAMP": ts,
+               "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
+               "Content-Type": "application/json"}
+    r = session.request(method, KALSHI + path, headers=headers,
+                        data=json.dumps(body) if body is not None else None, timeout=15)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Kalshi said {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+
+def real_ready():
+    return REAL_TRADING and KALSHI_KEY_ID and KALSHI_PRIVATE_KEY
+
+
+def kalshi_balance():
+    b = kalshi_signed("GET", "/portfolio/balance")
+    if b.get("balance_dollars") not in (None, ""):
+        return float(b["balance_dollars"])
+    return float(b.get("balance", 0)) / 100
+
+
+def order_number(o, name, cents=False):
+    for k in (f"{name}_dollars", f"{name}_fp", name):
+        v = o.get(k)
+        if v not in (None, ""):
+            v = float(v)
+            return v / 100 if cents and k == name else v
+    return 0.0
+
+
+def place_real_bet(rows, m, call, confidence, ask, now):
+    """Returns (count, cost, note). count/cost are None when no bet was placed."""
+    if not real_ready():
+        return None, None, ""
+    today_real = real_pnl_since(rows, et_date(now.isoformat()))
+    total_real = real_pnl_since(rows)
+    if total_real <= -REAL_TOTAL_LOSS_LIMIT:
+        return None, None, (f"🛑 stopped: total real loss limit hit ({total_real:+.2f}). "
+                            "No more real bets until the limit is reset.")
+    if today_real <= -REAL_DAILY_LOSS_LIMIT:
+        return None, None, f"🛑 skipped: daily real loss limit hit ({today_real:+.2f} today)"
+    if confidence != "High":
+        return None, None, "no bet: only high-confidence calls are bet"
+    if not ask or ask >= 1:
+        return None, None, "no bet: no price to buy at"
+    if ask > REAL_MAX_PRICE:
+        return None, None, f"no bet: {ask * 100:.0f}¢ is above the {REAL_MAX_PRICE * 100:.0f}¢ cap"
+    count = 0
+    while kalshi_fee(ask, count + 1) + ask * (count + 1) <= REAL_BET_DOLLARS:
+        count += 1
+    if count < 1:
+        return None, None, "no bet: one contract costs more than the bet size"
+    cents = int(round(ask * 100))
+    side = "yes" if call == "UP" else "no"
+    body = {"ticker": m["ticker"], "action": "buy", "side": side, "count": count,
+            "type": "limit", f"{side}_price": cents, "time_in_force": "fill_or_kill",
+            "client_order_id": f"pred-{m['ticker']}-{int(time.time())}"}
+    try:
+        o = kalshi_signed("POST", "/portfolio/orders", body).get("order", {})
+    except Exception as e:
+        return None, None, f"⚠️ real bet failed: {e}"
+    filled = order_number(o, "fill_count")
+    if filled < 1:
+        return None, None, f"real bet not filled (price moved above {cents}¢)"
+    cost = (order_number(o, "taker_fill_cost", cents=True) + order_number(o, "maker_fill_cost", cents=True)
+            + order_number(o, "taker_fees", cents=True) + order_number(o, "maker_fees", cents=True))
+    if cost <= 0:                  # Kalshi didn't report the cost; estimate it
+        cost = ask * filled + kalshi_fee(ask, int(filled))
+    return int(filled), round(cost, 2), (f"💵 REAL bet: bought {int(filled)} {call} at {cents}¢ "
+                                       f"for ${cost:.2f} (win +{filled - cost:.2f} / lose -{cost:.2f})")
 
 
 # ----------------------- alerts -------------------------
@@ -520,6 +637,11 @@ def make_call():
                       f"-{ask * PAPER_CONTRACTS + paper_fee:.2f})")
     value_call = bool(ask) and odds - ask - kalshi_fee(ask) > VALUE_EDGE
 
+    # Real bet ($5, high-confidence only) - only if REAL_TRADING is on and keys are set
+    already = any(r["ticker"] == m["ticker"] for r in rows)
+    real_count, real_cost, real_note = (None, None, "") if already else \
+        place_real_bet(rows, m, call, confidence.split(" ")[0], ask, now)
+
     warnings = []
     if today_pnl <= -DAILY_LOSS_LIMIT:
         warnings.append(f"🛑 Daily loss limit hit ({today_pnl:+.2f} today): no more paper trades today.")
@@ -544,10 +666,11 @@ def make_call():
          f"• Technicals: score {score:+d} → {tilt * 100:+.0f}% nudge"]
         + [f"   - {t}" for t in tech_lines]
         + ["", value_line, f"Paper trade: {paper_note}"]
+        + ([real_note] if real_note else [])
         + ([""] + warnings if warnings else [])
         + ["", scorecard(rows)]
     )
-    title = f"BTC 15m: {call} ({odds:.0%})"
+    title = f"BTC 15m: {call} ({odds:.0%})" + (" 💵 REAL $ bet placed" if real_count else "")
     notify(title, body, "chart_with_upwards_trend" if call == "UP" else "chart_with_downwards_trend")
 
     rows = read_log()
@@ -561,7 +684,9 @@ def make_call():
                      "btc_price": price, "too_close": "yes" if too_close else "", "result": "",
                      "paper_price": "" if paper_price is None else f"{paper_price:.4f}",
                      "paper_fee": "" if paper_fee is None else f"{paper_fee:.2f}",
-                     "paper_note": paper_note, "value_call": "yes" if value_call else ""})
+                     "paper_note": paper_note, "value_call": "yes" if value_call else "",
+                     "real_count": real_count or "", "real_cost": "" if real_cost is None else f"{real_cost:.2f}",
+                     "real_note": real_note})
         write_log(rows)
 
 
@@ -584,9 +709,22 @@ def main():
     print(f"Kalshi BTC 15-min predictor running. Calls go out {LEAD_MINUTES} min before each close.")
     automatic = (os.environ.get("GITHUB_EVENT_NAME") == "schedule"
                  or os.environ.get("HANDOFF") == "true")
+    real_status = "Real betting: OFF (predictions and paper trades only)."
+    if REAL_TRADING and not (KALSHI_KEY_ID and KALSHI_PRIVATE_KEY):
+        real_status = "Real betting: OFF. REAL_TRADING is on, but the Kalshi key secrets are missing."
+    elif real_ready():
+        try:
+            real_status = (f"💵 Real betting: ON. Kalshi balance ${kalshi_balance():,.2f}. "
+                           f"${REAL_BET_DOLLARS:.0f} bets on high-confidence calls up to "
+                           f"{REAL_MAX_PRICE * 100:.0f}¢; stops after -${REAL_DAILY_LOSS_LIMIT:.0f} in a day "
+                           f"or -${REAL_TOTAL_LOSS_LIMIT:.0f} in total.")
+        except Exception as e:
+            real_status = f"⚠️ Real betting is on, but Kalshi rejected the API key: {e}"
+    print(real_status)
     if not automatic:                                        # stay quiet on automatic restarts
         notify("Kalshi BTC predictor started",
-               f"You'll get an UP/DOWN call {LEAD_MINUTES} minutes before every 15-minute window closes.")
+               f"You'll get an UP/DOWN call {LEAD_MINUTES} minutes before every 15-minute window closes.\n"
+               + real_status)
     while True:
         send_at = next_send_time(datetime.now(timezone.utc))
         if stop_at and send_at > stop_at:
