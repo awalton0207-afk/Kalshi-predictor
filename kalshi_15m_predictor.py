@@ -10,6 +10,9 @@ What goes into each call:
   2. Kalshi's own odds - the live YES/NO prices (Kalshi's odds track real results closely)
   3. Technicals        - the signals from the Grok bot: RSI, EMA 9/21, 3-candle momentum,
                          last-5-minute trend, volume spike, 1-hour trend.
+                         Added from the kalshi-mcp-bot (rebuilt, not copied): Bollinger Band
+                         position, buying vs. selling pressure from live Coinbase trades,
+                         and engulfing-candle patterns on the 1-minute chart.
                          Grok's Kalshi research said these are weak on their own,
                          so they only nudge the odds a few percent.
   4. Warnings          - too close to call, quiet market, bot vs Kalshi disagreeing
@@ -25,7 +28,8 @@ What goes into each call:
   7. Real bets (optional) - when REAL_TRADING is "on" and a Kalshi API key is set,
                          it places a real $5 bet on HIGH-confidence calls only, priced
                          92¢ or less. It stops for the day after losing $10 and stops
-                         completely after losing $25 in total. Bets are fill-or-kill at the
+                         completely after losing $25 in total. After 3 real losses in a row
+                         it skips real bets for the next 2 windows (30 min). Bets are fill-or-kill at the
                          current ask, so it never pays more than the price it saw.
 
 Without a Kalshi API key it only sends predictions. Not financial advice.
@@ -64,6 +68,9 @@ ATR_PERIOD = 14
 VOLUME_SPIKE = 1.5                # 1.5x normal volume counts as a spike
 MOMENTUM_PCT = 0.15               # 3-candle move bigger than 0.15%
 SHORT_TREND_PCT = 0.05            # last-5-minute move bigger than 0.05%
+BB_PERIOD, BB_WIDTH = 20, 2       # Bollinger Bands on 1-minute candles
+PRESSURE_MINUTES = 5              # buying vs. selling pressure over the last 5 minutes
+PRESSURE_LEAN = 0.15              # 15% more buying than selling (or the reverse) counts
 
 # How the pieces are combined
 MODEL_WEIGHT = 0.5                # price-vs-target odds
@@ -85,6 +92,8 @@ REAL_BET_DOLLARS = 5.00           # most a single bet can cost, fee included
 REAL_MAX_PRICE = 0.92             # skip calls priced above 92¢ (payout too small)
 REAL_DAILY_LOSS_LIMIT = 10.00     # no more real bets today after losing this much
 REAL_TOTAL_LOSS_LIMIT = 25.00     # no more real bets at all after losing this much in total
+REAL_LOSS_STREAK = 3              # after this many real losses in a row...
+REAL_STREAK_PAUSE_MIN = 30        # ...skip real bets for this many minutes (2 windows)
 
 # How long one cloud run lasts before it hands off to the next one (GitHub allows 6 hours)
 MAX_RUNTIME_MINUTES = float(os.environ.get("MAX_RUNTIME_MINUTES", "0"))   # 0 = run forever
@@ -252,6 +261,44 @@ def to_float(v):
         return None
 
 
+def bollinger_position(closes, period=BB_PERIOD, width=BB_WIDTH):
+    """0 = on the lower band, 0.5 = middle, 1 = on the upper band (can go past 0 or 1)."""
+    if len(closes) < period:
+        return None
+    w = closes[-period:]
+    mid = sum(w) / period
+    sd = statistics.pstdev(w)
+    if sd == 0:
+        return 0.5
+    return (closes[-1] - (mid - width * sd)) / (2 * width * sd)
+
+
+def trade_pressure(minutes=PRESSURE_MINUTES):
+    """-1 = all selling, +1 = all buying, from Coinbase's recent trades (by size).
+    Coinbase's 'side' is the resting order's side, so side 'sell' = a buyer took the ask."""
+    try:
+        trades = get_json(f"https://api.exchange.coinbase.com/products/{COINBASE_PRODUCT}/trades",
+                          {"limit": 1000})
+    except Exception as e:
+        print("Coinbase trades failed:", e)
+        return None
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    buy = sell = 0.0
+    for t in trades:
+        try:
+            if parse_time(t["time"]) < cutoff:
+                continue
+            size = float(t["size"])
+        except Exception:
+            continue
+        if t.get("side") == "sell":
+            buy += size
+        elif t.get("side") == "buy":
+            sell += size
+    total = buy + sell
+    return None if total == 0 else (buy - sell) / total
+
+
 # ----------------------- signals ------------------------
 def technicals(c15, c1, c60, price):
     """Grok's signals. Positive score leans UP, negative leans DOWN."""
@@ -328,6 +375,49 @@ def technicals(c15, c1, c60, price):
         elif htf == "bearish" and score < 0:
             score -= 1
         lines.append(f"1-hour trend: {htf}")
+
+    # 7. Bollinger Band position (1-minute candles, live price)
+    c1_closes = [x["close"] for x in c1]
+    if c1_closes:
+        c1_closes[-1] = price
+    bp = bollinger_position(c1_closes)
+    if bp is not None:
+        if bp > 1.05:
+            score -= 1
+            lines.append(f"Bollinger: above the top band ({bp:.2f}), stretched (leans DOWN)")
+        elif bp < -0.05:
+            score += 1
+            lines.append(f"Bollinger: below the bottom band ({bp:.2f}), stretched (leans UP)")
+        elif bp > 0.65:
+            score += 1
+            lines.append(f"Bollinger: riding the upper half ({bp:.2f}) (leans UP)")
+        elif bp < 0.35:
+            score -= 1
+            lines.append(f"Bollinger: riding the lower half ({bp:.2f}) (leans DOWN)")
+        else:
+            lines.append(f"Bollinger: middle ({bp:.2f})")
+
+    # 8. Buying vs. selling pressure (live Coinbase trades, last 5 minutes)
+    pr = trade_pressure()
+    if pr is not None:
+        if pr > PRESSURE_LEAN:
+            score += 1
+            lines.append(f"Trade pressure {pr:+.2f}: more buying (leans UP)")
+        elif pr < -PRESSURE_LEAN:
+            score -= 1
+            lines.append(f"Trade pressure {pr:+.2f}: more selling (leans DOWN)")
+        else:
+            lines.append(f"Trade pressure {pr:+.2f}: balanced")
+
+    # 9. Engulfing candle on the last two finished 1-minute candles
+    if len(c1) >= 3:
+        a, b = c1[-3], c1[-2]
+        if a["close"] < a["open"] and b["close"] > b["open"] and b["close"] >= a["open"] and b["open"] <= a["close"]:
+            score += 1
+            lines.append("1-min candles: bullish engulfing (leans UP)")
+        elif a["close"] > a["open"] and b["close"] < b["open"] and b["close"] <= a["open"] and b["open"] >= a["close"]:
+            score -= 1
+            lines.append("1-min candles: bearish engulfing (leans DOWN)")
 
     atr_val = atr(c15, ATR_PERIOD)
     if atr_val:
@@ -515,6 +605,13 @@ def place_real_bet(rows, m, call, confidence, ask, now):
                             "No more real bets until the limit is reset.")
     if today_real <= -REAL_DAILY_LOSS_LIMIT:
         return None, None, f"🛑 skipped: daily real loss limit hit ({today_real:+.2f} today)"
+    settled = [r for r in rows if r.get("real_pnl")]
+    last = settled[-REAL_LOSS_STREAK:]
+    if len(last) == REAL_LOSS_STREAK and all(float(r["real_pnl"]) < 0 for r in last):
+        resume = parse_time(last[-1]["close_time_utc"]) + timedelta(minutes=REAL_STREAK_PAUSE_MIN)
+        if now < resume:
+            return None, None, (f"⏸️ skipped: {REAL_LOSS_STREAK} real losses in a row, "
+                                f"real bets resume after {local_time(resume)}")
     if confidence != "High":
         return None, None, "no bet: only high-confidence calls are bet"
     if not ask or ask >= 1:
