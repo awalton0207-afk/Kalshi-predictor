@@ -2,7 +2,7 @@
 Kalshi BTC 15-minute predictor
 ------------------------------
 For every Kalshi "BTC price up in next 15 mins?" window (series KXBTC15M), this
-sends an UP or DOWN call to your phone 10 minutes before the window closes.
+sends an UP or DOWN call to your phone 3 minutes into the window (12 minutes before it closes).
 
 What goes into each call:
   1. Price vs target   - where BTC is now compared with the window's target price,
@@ -52,7 +52,7 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")   # set as a GitHub secret
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-LEAD_MINUTES = 10                 # send the call this many minutes before the window closes
+LEAD_MINUTES = 12                 # send the call this many minutes before the window closes (12 = 3 min in)
 SERIES = "KXBTC15M"               # Kalshi BTC 15-minute markets
 COINBASE_PRODUCT = "BTC-USD"
 BINANCE_SYMBOL = "BTCUSDT"        # backup price source
@@ -723,7 +723,7 @@ def main():
     print(real_status)
     if not automatic:                                        # stay quiet on automatic restarts
         notify("Kalshi BTC predictor started",
-               f"You'll get an UP/DOWN call {LEAD_MINUTES} minutes before every 15-minute window closes.\n"
+               f"You'll get an UP/DOWN call {15 - LEAD_MINUTES} minutes into every 15-minute window ({LEAD_MINUTES} min before it closes).\n"
                + real_status)
     while True:
         send_at = next_send_time(datetime.now(timezone.utc))
